@@ -1,0 +1,36 @@
+{
+  "name": "omp-lemmeaskchat",
+  "version": "0.1.0",
+  "description": "Discord DM relay for oh-my-pi ask prompts with interactive buttons and typed replies",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "omp": {
+    "extensions": [
+      "src/index.ts"
+    ]
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=18.12.4"
+  },
+  "peerDependenciesMeta": {
+    "@oh-my-pi/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "5.8.3"
+  }
+}
