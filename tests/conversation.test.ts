@@ -258,6 +258,45 @@ describe("DiscordConversation transport in DiscordBridge", () => {
 		expect(bridge.open.size).toBe(0);
 		expect(convPrompts.length).toBe(1);
 
+		// Start a second ask question to verify literal "/btw answer" routes as ask customInput (transport not parsed)
+		const ask2Params: AskParams = {
+			questions: [
+				{
+					id: "q2",
+					question: "Literal answer check?",
+					options: [{ label: "Choice 1" }, { label: "Choice 2" }],
+				},
+			],
+		};
+		const ask2SendPromise = fake.waitForNextSend();
+		let ask2ResolvedAnswer: unknown = undefined;
+		const ask2Handle = startRemoteAsk({
+			bridge,
+			params: ask2Params,
+			delayMs: 0,
+			project: "test-proj",
+			onError: () => {},
+		});
+		ask2Handle.result.then((res) => {
+			ask2ResolvedAnswer = res;
+		});
+		const ask2Sent = await ask2SendPromise;
+		await waitForBridgeOpen(bridge, ask2Sent.messageId);
+		expect(bridge.open.has(ask2Sent.messageId)).toBe(true);
+
+		// User quote-replies to the ASK message with literal "/btw answer"
+		await fake.sendUserMessage(userId, "/btw answer", {
+			replyToMessageId: ask2Sent.messageId,
+		});
+
+		const results2 = await ask2Handle.result;
+		expect(results2).toBeDefined();
+		expect(results2).toHaveLength(1);
+		expect(results2?.[0]?.selectedOptions).toEqual([]);
+		expect(results2?.[0]?.customInput).toBe("/btw answer");
+		expect(ask2ResolvedAnswer).toEqual(results2);
+		expect(bridge.open.size).toBe(0);
+		expect(convPrompts.length).toBe(1);
 		conv.close();
 	});
 

@@ -14,11 +14,34 @@ import type { DiscordConversation } from "../src/discord/bridge.ts";
 import type {
 	HostApi,
 	HostContext,
+	HostEphemeralTurnOptions,
+	HostEphemeralTurnResult,
 	HostLogger,
 	HostSendUserMessageOptions,
 	HostToolDefinition,
 	ToolInfoLite,
 } from "../src/host.ts";
+
+function defined<T>(value: T | undefined | null, message = "Expected value to be defined"): T {
+	if (value === undefined || value === null) {
+		throw new Error(message);
+	}
+	return value;
+}
+
+function createDeferred<T = void>(): {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+	reject: (reason?: unknown) => void;
+} {
+	return Promise.withResolvers<T>();
+}
+
+async function drainMicrotasks(maxTurns = 25): Promise<void> {
+	for (let i = 0; i < maxTurns; i++) {
+		await Promise.resolve();
+	}
+}
 
 class TestClock implements TimerFactory {
 	private now = 0;
@@ -61,9 +84,6 @@ class TestClock implements TimerFactory {
 		}
 	}
 
-	get activeTimerCount(): number {
-		return this.timers.size;
-	}
 
 	clear(): void {
 		this.timers.clear();
@@ -74,6 +94,9 @@ class MockDiscordConversation implements DiscordConversation {
 	public sent: string[] = [];
 	public closed = false;
 	public sendGate?: Promise<void> | undefined;
+	public sendInFlight = 0;
+	private sendStartedWaiters: Array<() => void> = [];
+	private sendCompletedWaiters: Array<() => void> = [];
 
 	constructor(
 		private readonly bridge: MockDiscordBridge,
@@ -85,9 +108,39 @@ class MockDiscordConversation implements DiscordConversation {
 			throw new Error("Cannot send: conversation is closed");
 		}
 		this.sent.push(content);
-		if (this.sendGate) {
-			await this.sendGate;
+		this.sendInFlight++;
+		const started = this.sendStartedWaiters;
+		this.sendStartedWaiters = [];
+		for (const cb of started) {
+			cb();
 		}
+		try {
+			if (this.sendGate) {
+				await this.sendGate;
+			}
+		} finally {
+			this.sendInFlight--;
+			const completed = this.sendCompletedWaiters;
+			this.sendCompletedWaiters = [];
+			for (const cb of completed) {
+				cb();
+			}
+		}
+	}
+
+	waitForNextSendStart(): Promise<void> {
+		if (this.sendInFlight > 0) {
+			return Promise.resolve();
+		}
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.sendStartedWaiters.push(resolve);
+		return promise;
+	}
+
+	waitForNextSendComplete(): Promise<void> {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.sendCompletedWaiters.push(resolve);
+		return promise;
 	}
 
 	close(): void {
@@ -141,6 +194,9 @@ interface TestHarness {
 		notifications: Array<{ message: string; type?: string }>;
 		statuses: Map<string, string | undefined>;
 		sentUserMessages: Array<{ text: string; options?: HostSendUserMessageOptions }>;
+		ephemeralCalls: HostEphemeralTurnOptions[];
+		ephemeralInFlight: number;
+		ephemeralHandler?: ((options: HostEphemeralTurnOptions) => Promise<HostEphemeralTurnResult>) | undefined;
 		idle: boolean;
 		pendingMessages: boolean;
 		runningJobs: unknown[];
@@ -160,11 +216,15 @@ function createHarness(): TestHarness {
 	const notifications: Array<{ message: string; type?: string }> = [];
 	const statuses = new Map<string, string | undefined>();
 	const sentUserMessages: Array<{ text: string; options?: HostSendUserMessageOptions }> = [];
+	const ephemeralCalls: HostEphemeralTurnOptions[] = [];
 
 	const ctx: HostContext & {
 		notifications: Array<{ message: string; type?: string }>;
 		statuses: Map<string, string | undefined>;
 		sentUserMessages: Array<{ text: string; options?: HostSendUserMessageOptions }>;
+		ephemeralCalls: HostEphemeralTurnOptions[];
+		ephemeralInFlight: number;
+		ephemeralHandler?: ((options: HostEphemeralTurnOptions) => Promise<HostEphemeralTurnResult>) | undefined;
 		idle: boolean;
 		pendingMessages: boolean;
 		runningJobs: unknown[];
@@ -172,6 +232,8 @@ function createHarness(): TestHarness {
 		notifications,
 		statuses,
 		sentUserMessages,
+		ephemeralCalls,
+		ephemeralInFlight: 0,
 		idle: true,
 		pendingMessages: false,
 		runningJobs: [],
@@ -185,6 +247,18 @@ function createHarness(): TestHarness {
 		isIdle: () => ctx.idle,
 		hasPendingMessages: () => ctx.pendingMessages,
 		getAsyncJobSnapshot: () => ({ running: ctx.runningJobs }),
+		async runEphemeralTurn(options: HostEphemeralTurnOptions): Promise<HostEphemeralTurnResult> {
+			ephemeralCalls.push(options);
+			ctx.ephemeralInFlight++;
+			try {
+				if (ctx.ephemeralHandler) {
+					return await ctx.ephemeralHandler(options);
+				}
+				return { replyText: "Side answer for testing" };
+			} finally {
+				ctx.ephemeralInFlight--;
+			}
+		},
 		ui: {
 			notify(message: string, type?: "info" | "warning" | "error") {
 				notifications.push(type !== undefined ? { message, type } : { message });
@@ -1045,6 +1119,423 @@ describe("AwaySessionController lifecycle & conversations", () => {
 					(n) => n.type === "error" && n.message.toLowerCase().includes("sendusermessage"),
 				),
 			).toBe(true);
+		});
+	});
+
+	describe("/btw side questions and ephemeral turns", () => {
+		it("dispatches side questions via ctx.runEphemeralTurn while idle and delivers /btw answer to Discord", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			await controller.setAway(true, h.ctx);
+			expect(controller.isAway).toBe(true);
+			const conv = defined(h.bridge.activeConversation);
+			expect(conv.sent.length).toBe(1);
+
+			conv.onPrompt("/btw what is this function doing?");
+			await drainMicrotasks();
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+			expect(h.ctx.ephemeralCalls.length).toBe(1);
+			const call = defined(h.ctx.ephemeralCalls[0]);
+			expect(call.promptText).toContain("what is this function doing?");
+			expect(call.promptText).toContain("NEVER use tools");
+			expect(call.promptText).toContain("<btw>");
+			expect(call.promptText).toContain("</btw>");
+			expect(call.replyMaxBytes).toBe(Number.POSITIVE_INFINITY);
+			expect(call.signal).toBeDefined();
+			expect(call.signal?.aborted).toBe(false);
+
+			expect(conv.sent.length).toBe(2);
+			const sideAnswer = defined(conv.sent[1]);
+			expect(sideAnswer).toBe("Session “my-repo (abc12345)” — /btw\n\nSide answer for testing");
+			expect(sideAnswer).not.toContain("has finished");
+		});
+
+		it("dispatches side questions via ctx.runEphemeralTurn while main is busy without followUp or interrupting main", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			await controller.setAway(true, h.ctx);
+			controller.onAgentStart();
+			expect(controller.isBusy()).toBe(true);
+
+			const conv = defined(h.bridge.activeConversation);
+			conv.onPrompt("/btw:explain active operation");
+			await drainMicrotasks();
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+			expect(h.ctx.ephemeralCalls.length).toBe(1);
+			const call = defined(h.ctx.ephemeralCalls[0]);
+			expect(call.promptText).toContain("explain active operation");
+			expect(call.promptText).toContain("NEVER use tools");
+
+			expect(conv.sent.length).toBe(2);
+			const sideAnswer = defined(conv.sent[1]);
+			expect(sideAnswer).toBe("Session “my-repo (abc12345)” — /btw\n\nSide answer for testing");
+			expect(controller.isBusy()).toBe(true);
+		});
+
+		it("accepts whitespace and colon separators, but treats /btwfoo and /BTW as ordinary prompts", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			// Whitespace-separated /btw question
+			conv.onPrompt("/btw   why is this variable needed?");
+			await drainMicrotasks();
+			expect(h.ctx.ephemeralCalls.length).toBe(1);
+			expect(defined(h.ctx.ephemeralCalls[0]).promptText).toContain("why is this variable needed?");
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+
+			// Colon-separated /btw:question
+			conv.onPrompt("/btw:why colon?");
+			await drainMicrotasks();
+			expect(h.ctx.ephemeralCalls.length).toBe(2);
+			expect(defined(h.ctx.ephemeralCalls[1]).promptText).toContain("why colon?");
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+
+			// Prefix /btwfoo -> ordinary prompt, not side question
+			conv.onPrompt("/btwfoo this should route to main");
+			expect(h.ctx.ephemeralCalls.length).toBe(2);
+			expect(h.ctx.sentUserMessages.length).toBe(1);
+			expect(defined(h.ctx.sentUserMessages[0]).text).toBe("/btwfoo this should route to main");
+
+			// Uppercase /BTW -> case-sensitive, routes to main
+			conv.onPrompt("/BTW uppercase should route to main");
+			expect(h.ctx.ephemeralCalls.length).toBe(2);
+			expect(h.ctx.sentUserMessages.length).toBe(2);
+			expect(defined(h.ctx.sentUserMessages[1]).text).toBe("/BTW uppercase should route to main");
+		});
+
+		it("bare or whitespace-only /btw returns usage notice without model call and preserves original idle deadline", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			// Advance 800s of the 900s window
+			h.clock.tick(800_000);
+			expect(controller.isAway).toBe(true);
+
+			// Bare /btw
+			conv.onPrompt("/btw");
+			await drainMicrotasks();
+			expect(h.ctx.ephemeralCalls.length).toBe(0);
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+			expect(conv.sent.some((m) => m === "Use /btw <question> to ask a side question.")).toBe(true);
+
+			// Whitespace-only /btw
+			conv.onPrompt("/btw   ");
+			await drainMicrotasks();
+			expect(h.ctx.ephemeralCalls.length).toBe(0);
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+
+			// Colon-only /btw:
+			conv.onPrompt("/btw:");
+			await drainMicrotasks();
+			expect(h.ctx.ephemeralCalls.length).toBe(0);
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+
+			// Original idle deadline was at 900s (100s remaining).
+			// Advance 99s: still away
+			h.clock.tick(99_000);
+			expect(controller.isAway).toBe(true);
+
+			// Advance 2s (exceeds 900s total from initial setAway): expires!
+			h.clock.tick(2_000);
+			expect(controller.isAway).toBe(false);
+		});
+
+		it("surfaces model call failure to Discord without forwarding to main or disabling away", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			h.ctx.ephemeralHandler = async () => {
+				throw new Error("Simulated model context overflow");
+			};
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			conv.onPrompt("/btw failing question");
+			await drainMicrotasks();
+			expect(controller.isAway).toBe(true);
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+			expect(
+				conv.sent.some(
+					(m) =>
+						m.toLowerCase().includes("failed") ||
+						m.includes("Simulated model context overflow"),
+				),
+			).toBe(true);
+		});
+
+		it("surfaces missing runEphemeralTurn to Discord without forwarding to main or disabling away", async () => {
+			const ctxWithoutEphemeral: typeof h.ctx = {
+				...h.ctx,
+			};
+			delete (ctxWithoutEphemeral as Record<string, unknown>).runEphemeralTurn;
+
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			await controller.setAway(true, ctxWithoutEphemeral);
+			const conv = defined(h.bridge.activeConversation);
+
+			conv.onPrompt("/btw question without host capability");
+			await drainMicrotasks();
+			expect(controller.isAway).toBe(true);
+			expect(h.ctx.sentUserMessages.length).toBe(0);
+			expect(
+				conv.sent.some(
+					(m) =>
+						m.toLowerCase().includes("not supported") ||
+						m.toLowerCase().includes("unavailable") ||
+						m.toLowerCase().includes("error"),
+				),
+			).toBe(true);
+		});
+
+		it("holds away mode while side question or delivery is active longer than idle timeout, then applies full idle window", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			const deferredTurn = createDeferred<HostEphemeralTurnResult>();
+			h.ctx.ephemeralHandler = () => deferredTurn.promise;
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			conv.onPrompt("/btw slow question");
+			await drainMicrotasks();
+
+			// Prove model call actually started and is in flight
+			expect(h.ctx.ephemeralCalls.length).toBe(1);
+			expect(h.ctx.ephemeralInFlight).toBe(1);
+
+			// Advance clock past standard 900s timeout while side turn is in flight
+			h.clock.tick(950_000);
+			expect(controller.isAway).toBe(true);
+
+			// Gate the message send delivery
+			const sendGate = createDeferred<void>();
+			conv.sendGate = sendGate.promise;
+
+			// Resolve the model call; delivery is now active
+			deferredTurn.resolve({ replyText: "Slow model response" });
+			await drainMicrotasks();
+
+			// Prove send actually started and is blocked before advancing fakeclock
+			expect(conv.sendInFlight).toBe(1);
+			expect(conv.sent.some((m) => m.includes("Slow model response"))).toBe(true);
+
+			// Advance clock another 500s while delivery is gated
+			h.clock.tick(500_000);
+			expect(controller.isAway).toBe(true);
+
+			// Unblock delivery
+			sendGate.resolve();
+			await drainMicrotasks();
+
+			// Prove send has fully completed and idle timer has been armed before ticking 900s window
+			expect(conv.sendInFlight).toBe(0);
+
+			// All side work is now finished. Full 900s idle window must now apply.
+			h.clock.tick(899_000);
+			expect(controller.isAway).toBe(true);
+
+			h.clock.tick(2_000);
+			expect(controller.isAway).toBe(false);
+		});
+		it("cancels active side questions on setAway(false) and session switch, and late results do not leak", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			const deferredTurn = createDeferred<HostEphemeralTurnResult>();
+			let capturedSignal: AbortSignal | undefined;
+			h.ctx.ephemeralHandler = (opts) => {
+				capturedSignal = opts.signal;
+				return deferredTurn.promise;
+			};
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			conv.onPrompt("/btw abortable question");
+			await drainMicrotasks();
+
+			expect(capturedSignal).toBeDefined();
+			expect(capturedSignal?.aborted).toBe(false);
+
+			// Turning off away mode must abort the side question
+			await controller.setAway(false, h.ctx);
+			expect(capturedSignal?.aborted).toBe(true);
+
+			// Late resolution must not crash or leak
+			const convSentCount = conv.sent.length;
+			deferredTurn.resolve({ replyText: "Late response after away off" });
+			await drainMicrotasks();
+			expect(conv.sent.length).toBe(convSentCount);
+			expect(conv.sent.some((m) => m.includes("Late response after away off"))).toBe(false);
+		});
+		it("session switch cancels active side questions and late results do not reach new conversation", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			const deferredTurn = createDeferred<HostEphemeralTurnResult>();
+			let capturedSignal: AbortSignal | undefined;
+			h.ctx.ephemeralHandler = (opts) => {
+				capturedSignal = opts.signal;
+				return deferredTurn.promise;
+			};
+
+			await controller.setAway(true, h.ctx);
+			const conv1 = defined(h.bridge.activeConversation);
+
+			conv1.onPrompt("/btw question before switch");
+			await drainMicrotasks();
+
+			expect(capturedSignal?.aborted).toBe(false);
+
+			// Switch session
+			h.sessionId = "switched-session-456";
+			await controller.onSessionSwitch(h.ctx);
+			expect(capturedSignal?.aborted).toBe(true);
+
+			// Even if old promise resolves late, it must not send to any conversation
+			const conv1SentCount = conv1.sent.length;
+			deferredTurn.resolve({ replyText: "Late response after switch" });
+			await drainMicrotasks();
+			expect(conv1.sent.length).toBe(conv1SentCount);
+			expect(conv1.sent.some((m) => m.includes("Late response after switch"))).toBe(false);
+		});
+		it("main agent_start does NOT abort in-flight side questions", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			const deferredTurn = createDeferred<HostEphemeralTurnResult>();
+			let capturedSignal: AbortSignal | undefined;
+			h.ctx.ephemeralHandler = (opts) => {
+				capturedSignal = opts.signal;
+				return deferredTurn.promise;
+			};
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			conv.onPrompt("/btw question concurrent with main start");
+			await drainMicrotasks();
+
+			expect(capturedSignal).toBeDefined();
+			expect(capturedSignal?.aborted).toBe(false);
+
+			// Main agent starts
+			controller.onAgentStart();
+			expect(controller.isBusy()).toBe(true);
+
+			// Signal must NOT be aborted by main agent start
+			expect(capturedSignal?.aborted).toBe(false);
+
+			// Resolve side question
+			deferredTurn.resolve({ replyText: "Answer completed while main busy" });
+			await drainMicrotasks();
+
+			expect(conv.sent.some((m) => m.includes("Answer completed while main busy"))).toBe(true);
+		});
+
+		it("routes normal prompt as direct root send (not followUp) when main is idle even while side is pending", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			const deferredTurn = createDeferred<HostEphemeralTurnResult>();
+			h.ctx.ephemeralHandler = () => deferredTurn.promise;
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			// Side question starts and is pending
+			conv.onPrompt("/btw slow side question");
+			await drainMicrotasks();
+			expect(h.ctx.ephemeralCalls.length).toBe(1);
+
+			// Main agent is idle. User sends normal prompt.
+			conv.onPrompt("Do not treat me as followUp");
+			expect(h.ctx.sentUserMessages.length).toBe(1);
+			const msg = defined(h.ctx.sentUserMessages[0]);
+			expect(msg.text).toBe("Do not treat me as followUp");
+			expect(msg.options).toBeUndefined();
+
+			// Clean up side promise
+			deferredTurn.resolve({ replyText: "Done" });
+			await drainMicrotasks();
+			expect(conv.sent.some((m) => m.includes("Done"))).toBe(true);
+		});
+		it("preserves side response and does not expire when main turn completes while side question is pending", async () => {
+			const controller = new AwaySessionController(h.pi, {
+				bridgeFactory: () => h.bridge,
+				timerFactory: h.clock,
+			});
+
+			const deferredTurn = createDeferred<HostEphemeralTurnResult>();
+			h.ctx.ephemeralHandler = () => deferredTurn.promise;
+
+			await controller.setAway(true, h.ctx);
+			const conv = defined(h.bridge.activeConversation);
+
+			// Main turn starts
+			controller.onAgentStart();
+
+			// Side question arrives while main is busy
+			conv.onPrompt("/btw side question during turn");
+			await drainMicrotasks();
+
+			// Main turn completes
+			await controller.onAgentEnd({
+				messages: [{ role: "assistant", content: "Main turn answer" }],
+			});
+
+			expect(conv.sent.some((m) => m.includes("Main turn answer"))).toBe(true);
+			// Away mode must not expire even if idle timer ticks past 900s
+			h.clock.tick(950_000);
+			expect(controller.isAway).toBe(true);
+
+			// Side question resolves
+			deferredTurn.resolve({ replyText: "Side answer after main completion" });
+			await drainMicrotasks();
+
+			// Prove send has fully completed and idle timer has been armed before ticking 900s window
+			expect(conv.sent.some((m) => m.includes("Side answer after main completion"))).toBe(true);
+			expect(conv.sendInFlight).toBe(0);
+
+			// Now that side is also done, full idle window applies
+			h.clock.tick(899_000);
+			expect(controller.isAway).toBe(true);
+			h.clock.tick(2_000);
+			expect(controller.isAway).toBe(false);
 		});
 	});
 

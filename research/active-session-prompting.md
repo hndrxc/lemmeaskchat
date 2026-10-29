@@ -74,6 +74,58 @@ Accessible via `ctx.sessionManager` ([`packages/coding-agent/src/session/session
 - `ctx.sessionManager.getSessionFile()`: File path to the active session `.jsonl`.
 - `ctx.agent.kind`: `"main"` vs `"sub"`. Extensions must verify `ctx.agent.kind === "main"` to avoid spawning redundant bridges in subagents.
 
+### 2.6 Native /btw Semantics & Ephemeral Side-Turn Contract
+- **Primary Source Verification:** Inspected `@oh-my-pi/pi-coding-agent@18.14.0` (target) and `@oh-my-pi/pi-coding-agent@18.12.4` (minimum peer compatibility) npm tarballs directly from official package sources.
+- **Command Registration & Handler:**
+  - Defined in [`packages/coding-agent/src/slash-commands/builtin-lifecycle.ts:451-466`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/slash-commands/builtin-lifecycle.ts) as builtin command `name: "btw"`, `allowArgs: true`, with `handleTui`.
+  - TUI handler extracts `question = command.text.slice(("/" + command.name).length).trim()` and delegates to `BtwController.start(question, images, title)` ([`packages/coding-agent/src/modes/controllers/btw-controller.ts:374-510`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/modes/controllers/btw-controller.ts)).
+- **Text Parsing & Boundary Semantics:**
+  - Parsed by [`packages/coding-agent/src/slash-commands/helpers/parse.ts:22-36`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/slash-commands/helpers/parse.ts) (`parseSlashCommand`). Delimited by earliest whitespace or colon (`:`), so `/btw question` and `/btw:question` match.
+  - Matching is strict and case-sensitive against `BUILTIN_SLASH_COMMAND_LOOKUP` ([`packages/coding-agent/src/slash-commands/builtin-registry.ts:53-59`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/slash-commands/builtin-registry.ts)); uppercase `/BTW` or non-delimited prefixes like `/btwfoo` are not recognized as `/btw`.
+  - **Empty Boundary:** In TUI mode (`btw-controller.ts:412-420`), an empty question (`!trimmedQuestion`) opens the interactive `BtwHistoryPanel` overlay without dispatching any model turn. In RPC mode ([`packages/coding-agent/src/modes/rpc/rpc-btw.ts:70`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/modes/rpc/rpc-btw.ts)), an empty question throws `Error("btw requires a non-empty question")`. Native `/btw` never injects an empty turn into the session.
+- **Delivery API: Distinct Action vs. sendUserMessage aside:**
+  - Native `/btw` does **NOT** use `sendUserMessage(content, { deliverAs: "aside" })`.
+  - `sendUserMessage(..., { deliverAs: "aside" })` ([`packages/coding-agent/src/session/agent-session.ts:9986-10003`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/session/agent-session.ts)) injects a user turn into `#irc.queueAside()`, which delivers at the next step boundary within the main session loop, ends interruptible `wait` tools, executes tool calls, starts turns when idle, and commits to the main session transcript.
+  - Native `/btw` instead invokes `runBtwTurn` ([`packages/coding-agent/src/session/btw-turn.ts:60-117`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/session/btw-turn.ts)), which calls `session.runEphemeralTurn(...)` ([`packages/coding-agent/src/session/agent-session.ts:12630-12818`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/session/agent-session.ts)).
+- **Native Execution & Isolation Effects:**
+  - **History & Transcript:** Completely ephemeral. Session history (`AgentSession.messages`) is **NOT** modified (`agent-session.ts:12622`). The main `.jsonl` journal is not touched.
+  - **Tool Batches & Concurrency:** Runs concurrently alongside active tool batches or streaming main turns without blocking, steering, or aborting them (`agent-session.ts:12621-12622`).
+  - **Interruptible Waits:** Does not touch `#irc.queueAside` or `agent.steer`; does **NOT** wake or interrupt running `wait`/sleep tools.
+  - **Tools Execution:** Model prompt explicitly specifies `NEVER use tools` ([`packages/coding-agent/src/prompts/system/btw-user.md:1-8`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/prompts/system/btw-user.md)). Any tool calls produced are discarded and never executed.
+  - **Events & UI:** Does not emit standard `message_start`, `message_update`, `message_end`, `agent_start`, or `agent_end` events. Emits `btw_delta` and `btw_record` RPC events or renders in the TUI `btwContainer` (`BtwPanelComponent`).
+  - **Storage:** Persisted separately in session-scoped sidecar storage `BtwHistoryStore` in the artifacts directory (`packages/coding-agent/src/session/btw-history.ts:9-23`), not the session journal.
+  - **Promotion:** Can only enter session history if promoted via `session.branchFromBtw(...)` ([`agent-session.ts:13534-13642`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/session/agent-session.ts)), which forks the session with `reason: "btw"`.
+- **Extension API Signatures & Types:**
+  - Not present on `ExtensionAPI` (`pi`).
+  - Exposed on `ExtensionContext` as `ctx.runEphemeralTurn?(options: EphemeralTurnOptions): Promise<EphemeralTurnResult>`:
+    - Target `18.14.0`: [`packages/coding-agent/src/extensibility/extensions/types.ts:830`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/extensibility/extensions/types.ts) and [`runner.ts:1628-1654`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/extensibility/extensions/runner.ts).
+    - Minimum peer `18.12.4`: [`packages/coding-agent/src/extensibility/extensions/types.ts:750`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.12.4/src/extensibility/extensions/types.ts) and [`runner.ts:1447-1473`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.12.4/src/extensibility/extensions/runner.ts).
+  - **Required vs. Optional Fields:**
+    - In [`packages/coding-agent/src/session/agent-session-types.ts:622-644`](https://cdn.jsdelivr.net/npm/@oh-my-pi/pi-coding-agent@18.14.0/src/session/agent-session-types.ts), **`promptText: string` is the only required field** in `EphemeralTurnOptions`. All others (`promptImages?`, `history?`, `conversationKey?`, `tools?`, `maxTokens?`, `minimizeEffort?`, `maxContextBytes?`, `onTextDelta?`, `signal?`, `dedupeReply?`, `replyMaxBytes?`) are optional.
+    - `EphemeralTurnResult` returns `{ replyText: string; assistantMessage: AssistantMessage }`. `replyText` is a plain `string` containing the complete extracted response text.
+- **Exact Minimal Call & Native Wrapper:**
+  ```typescript
+  // Exact native system prompt wrapper from packages/coding-agent/src/prompts/system/btw-user.md:
+  const promptText = `<btw>\nEphemeral side question for current interactive session.\nAnswer briefly, directly; use conversation context already provided.\nNEVER use tools.\n\n${question}\n</btw>`;
+
+  const { replyText, assistantMessage }: EphemeralTurnResult = await ctx.runEphemeralTurn({
+    promptText, // only required option
+    replyMaxBytes: Number.POSITIVE_INFINITY, // prevents 4 KiB truncation
+    signal, // optional AbortSignal for side cancellation
+    onTextDelta, // optional streaming delta callback
+  });
+  ```
+- **Discord Relay Implementation:**
+  - Session-targeted `/btw` replies now call `ctx.runEphemeralTurn` rather than forwarding the literal command through `pi.sendUserMessage`. Side answers return to Discord without entering the main transcript; this does not expose the native TUI history viewer or promotion controls.
+  - **Implemented behavior:**
+    1. Match native case-sensitive token `/btw` delimited by whitespace (`/\s/`) or colon (`:`), ignoring non-delimited prefixes like `/btwfoo` and case mismatches like `/BTW`.
+    2. Bare `/btw` (empty question) returns a Discord usage notice without injecting a main prompt or cancelling/resetting the away idle deadline.
+    3. Non-empty `/btw <question>` invokes `ctx.runEphemeralTurn` with the exact `<btw>` native wrapper.
+    4. Multiple explicitly sent side questions run independently; the controller tracks an `AbortController` per active side turn.
+    5. Disabling away mode (`away off`) or switching sessions cancels only active side calls via their `AbortController`; main session execution is never aborted.
+    6. Ordinary Discord quote-replies and open ask answers remain completely unchanged.
+    7. No peer bump required (`18.12.4` already provides `ctx.runEphemeralTurn`).
+  - **Observed verification:** An actual interactive `omp 18.14.0` smoke used FakeDiscord and a loopback model provider. A side question completed while the main request remained in flight; both main requests excluded side-question and side-answer text. A second idle side question ran longer than the configured idle timeout without expiry, then away mode expired after side delivery. `BTW_HOST_SMOKE_RESULT pass:true`, with two main and two side model calls. Live Discord and production providers were not exercised.
 ---
 
 ## 3. Observed Runtime Verification

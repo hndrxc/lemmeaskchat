@@ -85,6 +85,18 @@ export interface HostSessionManager {
 	[key: string]: unknown;
 }
 
+export interface HostEphemeralTurnOptions {
+	promptText: string;
+	replyMaxBytes?: number;
+	signal?: AbortSignal;
+	[key: string]: unknown;
+}
+
+export interface HostEphemeralTurnResult {
+	replyText: string;
+	[key: string]: unknown;
+}
+
 export interface HostContext {
 	ui: HostUIContext;
 	hasUI: boolean;
@@ -98,6 +110,7 @@ export interface HostContext {
 		params: TParams,
 		options?: { signal?: AbortSignal; onUpdate?: ToolUpdateCallback<TDetails> },
 	): Promise<ToolResult<TDetails>>;
+	runEphemeralTurn?(options: HostEphemeralTurnOptions): Promise<HostEphemeralTurnResult>;
 	[key: string]: unknown;
 }
 
