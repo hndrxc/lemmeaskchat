@@ -22,6 +22,90 @@ import type { DiscordMessage, DiscordRest } from "./rest.ts";
 import { createDiscordRest } from "./rest.ts";
 
 /**
+ * Handle to an active Discord conversation session.
+ */
+export interface DiscordConversation {
+	send(content: string): Promise<void>;
+	close(): void;
+}
+
+/**
+ * Splits message text into chunks of at most maxLen UTF-16 code units,
+ * without splitting surrogate pairs across chunk boundaries.
+ */
+export function splitMessageChunks(text: string, maxLen = 2000): string[] {
+	if (text.length === 0) {
+		return [];
+	}
+	const chunks: string[] = [];
+	let start = 0;
+	while (start < text.length) {
+		let end = Math.min(start + maxLen, text.length);
+		if (end < text.length) {
+			const code = text.charCodeAt(end - 1);
+			if (code >= 0xd800 && code <= 0xdbff) {
+				if (end > start + 1) {
+					end -= 1;
+				}
+			}
+		}
+		chunks.push(text.slice(start, end));
+		start = end;
+	}
+	return chunks;
+}
+
+export class ActiveDiscordConversation implements DiscordConversation {
+	public closed = false;
+	public readonly targets = new Set<string>();
+	private sendChain: Promise<void> = Promise.resolve();
+	constructor(
+		private readonly bridge: DiscordBridge,
+		public readonly onPrompt: (text: string) => void,
+	) {}
+
+	public async send(content: string): Promise<void> {
+		if (this.closed || this.bridge.shuttingDown) {
+			throw new Error("Cannot send: conversation is closed");
+		}
+		const runSend = async () => {
+			if (this.closed || this.bridge.shuttingDown) {
+				throw new Error("Cannot send: conversation is closed");
+			}
+			const chunks = splitMessageChunks(content, 2000);
+			for (const chunk of chunks) {
+				if (this.closed || this.bridge.shuttingDown) {
+					break;
+				}
+				const messageId = await this.bridge.sendConversationMessage(chunk);
+				if (this.closed || this.bridge.shuttingDown) {
+					break;
+				}
+				this.targets.add(messageId);
+				this.bridge.registerConversationTarget(messageId, this);
+			}
+		};
+
+		const next = this.sendChain.then(runSend, runSend);
+		this.sendChain = next.catch(() => {});
+		await next;
+	}
+
+	public close(): void {
+		if (this.closed) {
+			return;
+		}
+		this.closed = true;
+		this.bridge.unregisterConversation(this);
+	}
+
+	public markClosed(): void {
+		this.closed = true;
+		this.targets.clear();
+	}
+}
+
+/**
  * An in-flight question waiting for a user answer through Discord.
  */
 export interface OpenQuestion {
@@ -85,6 +169,84 @@ export class DiscordBridge {
 	private _connected = false;
 	private isFirstReady = true;
 	private isShuttingDown = false;
+	private readonly activeConversations = new Set<ActiveDiscordConversation>();
+	private readonly conversationTargets = new Map<string, ActiveDiscordConversation>();
+	private readonly seenMessageIds = new Set<string>();
+	private readonly seenMessageIdQueue: string[] = [];
+	private static readonly MAX_SEEN_MESSAGES = 1000;
+
+	public get shuttingDown(): boolean {
+		return this.isShuttingDown;
+	}
+
+	public async openConversation(
+		onPrompt: (text: string) => void,
+	): Promise<DiscordConversation> {
+		if (this.isShuttingDown) {
+			throw new Error("Cannot open conversation: bridge has been shut down");
+		}
+
+		await this.acquire();
+
+		if (this.isShuttingDown) {
+			this.release();
+			throw new Error("Cannot open conversation: bridge has been shut down");
+		}
+
+		const conversation = new ActiveDiscordConversation(this, onPrompt);
+		this.activeConversations.add(conversation);
+		return conversation;
+	}
+
+	public registerConversationTarget(
+		messageId: string,
+		conversation: ActiveDiscordConversation,
+	): void {
+		if (this.isShuttingDown || conversation.closed) {
+			return;
+		}
+		this.conversationTargets.set(messageId, conversation);
+	}
+
+	public unregisterConversation(conversation: ActiveDiscordConversation): void {
+		for (const targetId of conversation.targets) {
+			this.conversationTargets.delete(targetId);
+		}
+		conversation.targets.clear();
+		if (this.activeConversations.delete(conversation)) {
+			this.release();
+		}
+	}
+
+	public async sendConversationMessage(content: string): Promise<string> {
+		if (this.isShuttingDown) {
+			throw new Error("Cannot send: bridge has been shut down");
+		}
+		const channelId = await this.ensureDmChannel();
+		const messageId = await this.rest.send(channelId, { content });
+		if (this.lastSeenMessageId === undefined) {
+			this.updateLastSeenMessageId(messageId);
+		}
+		return messageId;
+	}
+
+	private claimMessageId(id: string): boolean {
+		if (!id) {
+			return false;
+		}
+		if (this.seenMessageIds.has(id)) {
+			return false;
+		}
+		this.seenMessageIds.add(id);
+		this.seenMessageIdQueue.push(id);
+		if (this.seenMessageIdQueue.length > DiscordBridge.MAX_SEEN_MESSAGES) {
+			const oldest = this.seenMessageIdQueue.shift();
+			if (oldest !== undefined) {
+				this.seenMessageIds.delete(oldest);
+			}
+		}
+		return true;
+	}
 
 	private gateway: BridgeGatewayLike | undefined;
 	private readyPromise: Promise<void> | undefined;
@@ -121,42 +283,42 @@ export class DiscordBridge {
 			return;
 		}
 
-		if (this.readyPromise) {
+		let readyPromise = this.readyPromise;
+		if (!readyPromise) {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			this.readyPromise = promise;
+			this.readyResolve = resolve;
+			this.readyReject = reject;
+			const timer = setTimeout(() => {
+				this.readyTimer = undefined;
+				const timeoutErr = new Error("Timeout awaiting Discord gateway READY (15s)");
+				this.handleFatal(timeoutErr);
+			}, 15_000);
+			timer.unref?.();
+			this.readyTimer = timer;
+
+			readyPromise = promise;
+
 			try {
-				await this.readyPromise;
+				this.gateway = this.gatewayFactory(this.token, {
+					...(this.logger !== undefined ? { logger: this.logger } : {}),
+					onReady: (botUserId: string) => this.handleReady(botUserId),
+					onMessage: (msg: GatewayMessageCreateData) => this.handleMessage(msg),
+					onInteraction: (data: GatewayInteractionCreateData) => this.handleInteraction(data),
+					onFatal: (err: Error) => this.handleFatal(err),
+				});
+
+				this.gateway.start();
 			} catch (err) {
-				this.refs = Math.max(0, this.refs - 1);
-				if (this.refs === 0) {
-					this.stopGateway();
-				}
-				throw err;
+				this.stopGateway(err instanceof Error ? err : new Error(String(err)));
 			}
-			return;
 		}
 
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		this.readyPromise = promise;
-		this.readyResolve = resolve;
-		this.readyReject = reject;
-		const timer = setTimeout(() => {
-			this.readyTimer = undefined;
-			const timeoutErr = new Error("Timeout awaiting Discord gateway READY (15s)");
-			this.handleFatal(timeoutErr);
-		}, 15_000);
-		timer.unref?.();
-		this.readyTimer = timer;
-
 		try {
-			this.gateway = this.gatewayFactory(this.token, {
-				...(this.logger !== undefined ? { logger: this.logger } : {}),
-				onReady: (botUserId: string) => this.handleReady(botUserId),
-				onMessage: (msg: GatewayMessageCreateData) => this.handleMessage(msg),
-				onInteraction: (data: GatewayInteractionCreateData) => this.handleInteraction(data),
-				onFatal: (err: Error) => this.handleFatal(err),
-			});
-
-			this.gateway.start();
-			await this.readyPromise;
+			await readyPromise;
+			if (this.isShuttingDown) {
+				throw new Error("Cannot acquire DiscordBridge: bridge has been shut down");
+			}
 		} catch (err) {
 			this.refs = Math.max(0, this.refs - 1);
 			if (this.refs === 0) {
@@ -207,7 +369,9 @@ export class DiscordBridge {
 		}
 
 		this.open.set(messageId, oq);
-		this.updateLastSeenMessageId(messageId);
+		if (this.lastSeenMessageId === undefined) {
+			this.updateLastSeenMessageId(messageId);
+		}
 		return messageId;
 	}
 
@@ -251,10 +415,17 @@ export class DiscordBridge {
 		reason: "terminal" | "cancelled" | "shutdown" = "shutdown",
 	): Promise<void> {
 		this.isShuttingDown = true;
+		this.refs = 0;
 		if (currentBridge === this) {
 			currentBridge = undefined;
 			currentKey = undefined;
 		}
+		for (const conv of this.activeConversations) {
+			conv.markClosed();
+		}
+		this.activeConversations.clear();
+		this.conversationTargets.clear();
+
 
 		const entries = Array.from(this.open.entries());
 		this.open.clear();
@@ -321,7 +492,7 @@ export class DiscordBridge {
 		return this.botUserId;
 	}
 
-	private stopGateway(): void {
+	private stopGateway(reason?: Error): void {
 		if (this.readyTimer !== undefined) {
 			clearTimeout(this.readyTimer as unknown as number);
 			this.readyTimer = undefined;
@@ -330,7 +501,7 @@ export class DiscordBridge {
 			const reject = this.readyReject;
 			this.readyReject = undefined;
 			this.readyResolve = undefined;
-			reject(new Error("Gateway stopped before READY"));
+			reject(reason ?? new Error("Gateway stopped before READY"));
 		}
 		this.readyPromise = undefined;
 		this._connected = false;
@@ -450,6 +621,10 @@ export class DiscordBridge {
 			if (d.author.bot) {
 				return;
 			}
+			if (!this.claimMessageId(d.id)) {
+				return;
+			}
+
 
 			let dmId = this.dmChannelId;
 			if (!dmId) {
@@ -466,6 +641,24 @@ export class DiscordBridge {
 			}
 
 			this.updateLastSeenMessageId(d.id);
+			const refId = d.message_reference?.message_id;
+			if (refId) {
+				const conv = this.conversationTargets.get(refId);
+				if (conv && !conv.closed) {
+					if (typeof d.content === "string" && d.content.trim().length > 0) {
+						try {
+							conv.onPrompt(d.content);
+						} catch (err) {
+							const error = err instanceof Error ? err : new Error(String(err));
+							this.logger?.warn("Error in conversation onPrompt callback", {
+								error: error.message,
+							});
+						}
+					}
+					return;
+				}
+			}
+
 
 			if (this.open.size === 0) {
 				return;
