@@ -1,11 +1,26 @@
 import { basename } from "node:path";
 import type { AskParams } from "./ask-format.ts";
 import { createAskExecute } from "./ask-race.ts";
-import { isConfigured, loadConfig, saveConfig } from "./config.ts";
+import {
+	AwaySessionController,
+	type AwaySessionControllerOptions,
+} from "./away-session.ts";
+import {
+	isConfigured,
+	loadConfig,
+	parseAwayTimeout,
+	saveConfig,
+} from "./config.ts";
 import { getBridge, getCurrentBridge } from "./discord/bridge.ts";
 import { DiscordApiError, createDiscordRest } from "./discord/rest.ts";
-import type { HostApi, HostCommandContext, HostContext } from "./host.ts";
+import type {
+	HostApi,
+	HostCommandContext,
+	HostContext,
+	ToolUpdateCallback,
+} from "./host.ts";
 import { startRemoteAsk } from "./remote-ask.ts";
+
 interface CachedNativeAsk {
 	description: string;
 	parameters: unknown;
@@ -17,12 +32,26 @@ let firstSessionSeen = false;
 const HINT_50007 =
 	"Discord bot cannot DM you: share a server with the bot and allow DMs from that server's members.";
 
-export default function lemmeaskchat(pi: HostApi): void {
+export default function lemmeaskchat(
+	pi: HostApi,
+	options?: AwaySessionControllerOptions,
+): void {
+	const away = new AwaySessionController(pi, options);
+
 	pi.registerCommand("lemmeaskchat", {
 		description:
-			"Discord DM relay for ask: setup | away [on|off] | delay <seconds> | test | status",
+			"Discord DM relay for ask: setup | away [on|off] | timeout <seconds> | delay <seconds> | test | status",
 		getArgumentCompletions: (prefix: string) =>
-			["setup", "away", "away on", "away off", "delay", "test", "status"]
+			[
+				"setup",
+				"away",
+				"away on",
+				"away off",
+				"timeout",
+				"delay",
+				"test",
+				"status",
+			]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s })),
 		handler: async (args: string, ctx: HostCommandContext) => {
@@ -47,6 +76,7 @@ export default function lemmeaskchat(pi: HostApi): void {
 					`Token: ${maskedToken}`,
 					`User ID: ${userId}`,
 					`Away: ${cfg.away ? "on" : "off"}`,
+					`Timeout: ${cfg.awayTimeoutSeconds}s`,
 					`Delay: ${cfg.delaySeconds}s`,
 					`Bridge: ${bridgeConnected ? "connected" : "disconnected"}`,
 				].join("\n");
@@ -78,6 +108,7 @@ export default function lemmeaskchat(pi: HostApi): void {
 					await rest.send(dmChannelId, { content: "✅ lemmeaskchat connected to omp." });
 					saveConfig(agentDir, { discordBotToken: token, discordUserId: userId });
 					ctx.ui.notify(`Connected to Discord bot ${me.username}`, "info");
+					await away.onCredentialsChanged(ctx);
 				} catch (err: unknown) {
 					let message: string;
 					if (err && typeof err === "object") {
@@ -120,9 +151,37 @@ export default function lemmeaskchat(pi: HostApi): void {
 					return;
 				}
 
-				saveConfig(agentDir, { away: newAway });
-				ctx.ui.setStatus("lemmeaskchat", newAway ? "away → Discord" : undefined);
-				ctx.ui.notify(`Away mode ${newAway ? "on" : "off"}.`, "info");
+				await away.setAway(newAway, ctx);
+				return;
+			}
+
+			if (
+				trimmed === "timeout" ||
+				trimmed.startsWith("timeout ") ||
+				trimmed.startsWith("timeout\t")
+			) {
+				const parts = trimmed.split(/\s+/);
+				const val = parts[1];
+				if (parts.length !== 2 || val === undefined) {
+					ctx.ui.notify("Usage: /lemmeaskchat timeout <seconds>", "error");
+					return;
+				}
+
+				const parsed = parseAwayTimeout(val);
+				if (parsed === undefined) {
+					ctx.ui.notify(
+						"Invalid timeout: expected an integer between 1 and 2147483 seconds.",
+						"error",
+					);
+					return;
+				}
+
+				saveConfig(agentDir, { awayTimeoutSeconds: parsed });
+				away.resetTimeout();
+				ctx.ui.notify(
+					`Timeout set to ${parsed} second${parsed === 1 ? "" : "s"}.`,
+					"info",
+				);
 				return;
 			}
 
@@ -241,7 +300,7 @@ export default function lemmeaskchat(pi: HostApi): void {
 			}
 
 			ctx.ui.notify(
-				`Unknown command: /lemmeaskchat ${trimmed}. Usage: /lemmeaskchat setup | away [on|off] | delay <seconds> | test | status`,
+				`Unknown command: /lemmeaskchat ${trimmed}. Usage: /lemmeaskchat setup | away [on|off] | timeout <seconds> | delay <seconds> | test | status`,
 				"error",
 			);
 		},
@@ -253,12 +312,6 @@ export default function lemmeaskchat(pi: HostApi): void {
 		}
 
 		const agentDir = pi.pi.getAgentDir();
-		const config = loadConfig(agentDir);
-		if (config.away) {
-			ctx.ui.setStatus("lemmeaskchat", "away → Discord");
-		} else {
-			ctx.ui.setStatus("lemmeaskchat", undefined);
-		}
 
 		const allTools = pi.getAllTools();
 		const askTool = allTools.find((tool) => tool.name === "ask");
@@ -278,34 +331,73 @@ export default function lemmeaskchat(pi: HostApi): void {
 		}
 		firstSessionSeen = true;
 
-		if (!askTool || !nativeAsk) {
-			return;
+		if (askTool && nativeAsk) {
+			const execute = createAskExecute({
+				agentDir,
+				logger: pi.logger,
+			});
+
+			const wrappedExecute = async (
+				toolCallId: string,
+				params: AskParams,
+				signal: AbortSignal | undefined,
+				onUpdate: ToolUpdateCallback | undefined,
+				toolCtx: HostContext,
+			) => {
+				away.setAskActive(true);
+				try {
+					return await execute(toolCallId, params, signal, onUpdate, toolCtx);
+				} finally {
+					away.setAskActive(false);
+				}
+			};
+
+			pi.registerTool({
+				name: "ask",
+				label: "Ask",
+				description: nativeAsk.description,
+				parameters: nativeAsk.parameters,
+				approval: "read",
+				strict: true,
+				concurrency: "exclusive",
+				execute: wrappedExecute,
+			});
 		}
 
-		const execute = createAskExecute({
-			agentDir,
-			logger: pi.logger,
-		});
-
-		pi.registerTool({
-			name: "ask",
-			label: "Ask",
-			description: nativeAsk.description,
-			parameters: nativeAsk.parameters,
-			approval: "read",
-			strict: true,
-			concurrency: "exclusive",
-			execute,
-		});
+		await away.onSessionStart(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event: unknown, ctx: HostContext) => {
-		if (ctx.agent.kind !== "main" || !ctx.hasUI) return;
+		if (ctx.agent.kind !== "main" || !ctx.hasUI) {
+			return;
+		}
+		away.onSessionShutdown(ctx);
 		try {
 			await getCurrentBridge()?.shutdownAll("shutdown");
 		} catch (err) {
 			const error = err instanceof Error ? err : new Error(String(err));
 			pi.logger?.warn("Error during session_shutdown", { error: error.message });
 		}
+	});
+
+	pi.on("session_switch", async (_event: unknown, ctx: HostContext) => {
+		if (ctx.agent.kind !== "main" || !ctx.hasUI) {
+			return;
+		}
+		await away.onSessionSwitch(ctx);
+	});
+
+	pi.on("agent_start", (_event: unknown, ctx: HostContext) => {
+		if (ctx.agent.kind !== "main") {
+			return;
+		}
+		away.onAgentStart();
+	});
+
+	pi.on("agent_end", async (event: unknown, ctx: HostContext) => {
+		if (ctx.agent.kind !== "main") {
+			return;
+		}
+		await away.onAgentEnd(event);
 	});
 }

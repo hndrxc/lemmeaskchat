@@ -79,11 +79,21 @@ export interface HostAgentIdentity {
 	[key: string]: unknown;
 }
 
+export interface HostSessionManager {
+	getSessionId(): string;
+	getSessionFile?(): string;
+	[key: string]: unknown;
+}
+
 export interface HostContext {
 	ui: HostUIContext;
 	hasUI: boolean;
 	cwd: string;
 	agent: HostAgentIdentity;
+	sessionManager?: HostSessionManager;
+	isIdle?(): boolean;
+	hasPendingMessages?(): boolean;
+	getAsyncJobSnapshot?(): unknown;
 	invokeTool?<TDetails = unknown, TParams = unknown>(
 		params: TParams,
 		options?: { signal?: AbortSignal; onUpdate?: ToolUpdateCallback<TDetails> },
@@ -95,14 +105,58 @@ export interface HostCommandContext extends HostContext {
 	[key: string]: unknown;
 }
 
+export interface HostSendUserMessageOptions {
+	deliverAs?: "steer" | "followUp" | "aside";
+	[key: string]: unknown;
+}
+
+export interface HostAgentMessage {
+	role?: string;
+	content?: unknown;
+	[key: string]: unknown;
+}
+
+export interface HostAgentEndEvent {
+	type?: "agent_end";
+	messages?: HostAgentMessage[];
+	willContinue?: boolean;
+	awaitingAsyncWork?: boolean;
+	[key: string]: unknown;
+}
+
+export interface HostAgentStartEvent {
+	type: "agent_start";
+	[key: string]: unknown;
+}
+
+export interface HostSessionStartEvent {
+	type: "session_start";
+	[key: string]: unknown;
+}
+
+export interface HostSessionShutdownEvent {
+	type: "session_shutdown";
+	[key: string]: unknown;
+}
+
+export interface HostSessionSwitchEvent {
+	type: "session_switch";
+	reason?: "new" | "resume" | "fork";
+	previousSessionFile?: string;
+	[key: string]: unknown;
+}
+
 export type HostEventHandler<E = unknown> = (event: E, ctx: HostContext) => Promise<void> | void;
 
 export interface HostApi {
-	on(event: string, handler: HostEventHandler<any>): void;
+	on(event: string, handler: HostEventHandler<unknown>): void;
 	registerTool<TParams = unknown, TDetails = unknown>(tool: HostToolDefinition<TParams, TDetails>): void;
 	registerCommand(name: string, options: HostCommandOptions): void;
 	getAllTools(): ToolInfoLite[];
 	logger: HostLogger;
+	getSessionName?(): string | undefined;
+	setSessionName?(name: string): Promise<void>;
+	sendUserMessage?(content: string, options?: HostSendUserMessageOptions): void;
 	pi: {
 		getAgentDir(): string;
 		[key: string]: unknown;

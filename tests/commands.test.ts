@@ -73,8 +73,45 @@ function createFakeCommandContext(options: FakeHostContextOptions = {}): HostCom
 
 	return ctx;
 }
+function createMockBridge(conversationSender?: (msg: string) => Promise<void>) {
+	const sentMessages: string[] = [];
+	let promptHandler: ((text: string) => void) | undefined;
+	const conv = {
+		closed: false,
+		async send(content: string) {
+			sentMessages.push(content);
+			if (conversationSender) {
+				await conversationSender(content);
+			}
+		},
+		close() {
+			this.closed = true;
+		},
+	};
+	return {
+		sentMessages,
+		get promptHandler() {
+			return promptHandler;
+		},
+		conv,
+		openConversation: async (onPrompt: (text: string) => void) => {
+			promptHandler = onPrompt;
+			return conv;
+		},
+	};
+}
 
-function createFakeHostApi(agentDir: string) {
+interface FakeHostApi {
+	api: HostApi;
+	eventHandlers: Map<string, HostEventHandler<unknown>[]>;
+	tools: HostToolDefinition<unknown, unknown>[];
+	getCommand(): HostCommandOptions;
+	emit: (event: string, ctx: HostContext) => Promise<void>;
+}
+
+const createdHosts: FakeHostApi[] = [];
+
+function createFakeHostApi(agentDir: string): FakeHostApi {
 	const eventHandlers = new Map<string, HostEventHandler<unknown>[]>();
 	const tools: HostToolDefinition<unknown, unknown>[] = [];
 	let registeredCommand: { name: string; options: HostCommandOptions } | undefined;
@@ -115,7 +152,7 @@ function createFakeHostApi(agentDir: string) {
 		},
 	};
 
-	return {
+	const host: FakeHostApi = {
 		api,
 		eventHandlers,
 		tools,
@@ -132,6 +169,8 @@ function createFakeHostApi(agentDir: string) {
 			}
 		},
 	};
+	createdHosts.push(host);
+	return host;
 }
 
 describe("/lemmeaskchat commands & lifecycle", () => {
@@ -156,6 +195,19 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 	});
 
 	afterEach(async () => {
+		// Clean up any controller timers by emitting session_shutdown for all created hosts
+		for (const host of createdHosts) {
+			try {
+				await host.emit(
+					"session_shutdown",
+					createFakeCommandContext({ agentKind: "main", hasUI: true }),
+				);
+			} catch {
+				// ignore
+			}
+		}
+		createdHosts.length = 0;
+
 		// Clean up any singleton bridge instance
 		const bridge = getCurrentBridge();
 		if (bridge) {
@@ -248,10 +300,31 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 	});
 
 	describe("away mode toggles, explicit states, and persistence", () => {
-		it("toggles away mode with bare 'away' command and persists changes", async () => {
+		it("rejects enabling away mode when unconfigured without setting false status", async () => {
 			const agentDir = makeTempAgentDir();
 			const host = createFakeHostApi(agentDir);
 			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const ctx = createFakeCommandContext();
+			await command.handler("away", ctx);
+
+			expect(loadConfig(agentDir).away).toBe(false);
+			expect(ctx.statuses.get("lemmeaskchat")).toBeUndefined();
+			expect(ctx.notifications.length).toBe(1);
+			expect(defined(ctx.notifications[0]).type).toBe("error");
+			expect(defined(ctx.notifications[0]).message).toContain("not configured");
+		});
+
+		it("toggles away mode with bare 'away' command when configured", async () => {
+			const agentDir = makeTempAgentDir();
+			saveConfig(agentDir, {
+				discordBotToken: "mock-token",
+				discordUserId: "mock-user",
+			});
+			const mockBridge = createMockBridge();
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api, { bridgeFactory: () => mockBridge });
 			const command = host.getCommand();
 
 			// Initial state is away: false
@@ -265,6 +338,7 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 			expect(ctx1.statuses.get("lemmeaskchat")).toBe("away → Discord");
 			expect(ctx1.notifications.length).toBe(1);
 			expect(defined(ctx1.notifications[0]).type).toBe("info");
+			expect(mockBridge.sentMessages.length).toBe(1);
 
 			// Second toggle -> off
 			const ctx2 = createFakeCommandContext();
@@ -274,12 +348,18 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 			expect(ctx2.statuses.get("lemmeaskchat")).toBeUndefined();
 			expect(ctx2.notifications.length).toBe(1);
 			expect(defined(ctx2.notifications[0]).type).toBe("info");
+			expect(mockBridge.conv.closed).toBe(true);
 		});
 
 		it("sets away mode explicitly with 'away on' and 'away off'", async () => {
 			const agentDir = makeTempAgentDir();
+			saveConfig(agentDir, {
+				discordBotToken: "mock-token",
+				discordUserId: "mock-user",
+			});
+			const mockBridge = createMockBridge();
 			const host = createFakeHostApi(agentDir);
-			lemmeaskchat(host.api);
+			lemmeaskchat(host.api, { bridgeFactory: () => mockBridge });
 			const command = host.getCommand();
 
 			// Explicit 'away on'
@@ -299,6 +379,7 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 			expect(ctxOff.statuses.get("lemmeaskchat")).toBeUndefined();
 			expect(ctxOff.notifications.length).toBe(1);
 			expect(defined(ctxOff.notifications[0]).type).toBe("info");
+			expect(mockBridge.conv.closed).toBe(true);
 		});
 
 		it("rejects invalid away arguments without modifying config or UI status", async () => {
@@ -317,6 +398,94 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 			expect(ctx.statuses.size).toBe(0);
 			// Config must remain unmodified
 			expect(loadConfig(agentDir).away).toBe(true);
+		});
+	});
+
+	describe("timeout configuration and validation", () => {
+		it("status command reports current timeout", async () => {
+			const agentDir = makeTempAgentDir();
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const ctx = createFakeCommandContext();
+			await command.handler("status", ctx);
+
+			expect(ctx.notifications.length).toBe(1);
+			expect(defined(ctx.notifications[0]).message).toContain("Timeout: 900s");
+		});
+
+		it("argument completions include timeout subcommand", async () => {
+			const agentDir = makeTempAgentDir();
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const rawCompletions = await command.getArgumentCompletions?.("time");
+			const completions = rawCompletions ?? [];
+			expect(completions.map((c) => c.value)).toContain("timeout");
+		});
+
+		it("persists valid timeout and notifies user", async () => {
+			const agentDir = makeTempAgentDir();
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const ctx = createFakeCommandContext();
+			await command.handler("timeout 1800", ctx);
+
+			expect(loadConfig(agentDir).awayTimeoutSeconds).toBe(1800);
+			expect(ctx.notifications.length).toBe(1);
+			expect(defined(ctx.notifications[0]).type).toBe("info");
+			expect(defined(ctx.notifications[0]).message).toBe("Timeout set to 1800 seconds.");
+		});
+
+		it("handles singular second grammar for timeout 1", async () => {
+			const agentDir = makeTempAgentDir();
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const ctx = createFakeCommandContext();
+			await command.handler("timeout 1", ctx);
+
+			expect(loadConfig(agentDir).awayTimeoutSeconds).toBe(1);
+			expect(defined(ctx.notifications[0]).message).toBe("Timeout set to 1 second.");
+		});
+
+		it("rejects bare timeout with usage error", async () => {
+			const agentDir = makeTempAgentDir();
+			saveConfig(agentDir, { awayTimeoutSeconds: 600 });
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const ctx = createFakeCommandContext();
+			await command.handler("timeout", ctx);
+
+			expect(ctx.notifications.length).toBe(1);
+			expect(defined(ctx.notifications[0]).type).toBe("error");
+			expect(defined(ctx.notifications[0]).message).toBe("Usage: /lemmeaskchat timeout <seconds>");
+			expect(loadConfig(agentDir).awayTimeoutSeconds).toBe(600);
+		});
+
+		it("strictly rejects 0, negative values, non-integers, and out-of-range values", async () => {
+			const agentDir = makeTempAgentDir();
+			saveConfig(agentDir, { awayTimeoutSeconds: 900 });
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+			const command = host.getCommand();
+
+			const invalidInputs = ["timeout 0", "timeout -10", "timeout 12.5", "timeout abc", "timeout 2147484"];
+			for (const input of invalidInputs) {
+				const ctx = createFakeCommandContext();
+				await command.handler(input, ctx);
+				expect(ctx.notifications.length).toBe(1);
+				expect(defined(ctx.notifications[0]).type).toBe("error");
+				expect(defined(ctx.notifications[0]).message).toContain("Invalid timeout");
+			}
+			expect(loadConfig(agentDir).awayTimeoutSeconds).toBe(900);
 		});
 	});
 
@@ -754,10 +923,15 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 	describe("session lifecycle guards (main vs sub agent)", () => {
 		it("session_start updates status only for main agent with UI", async () => {
 			const agentDir = makeTempAgentDir();
-			saveConfig(agentDir, { away: true });
+			saveConfig(agentDir, {
+				away: true,
+				discordBotToken: "mock-token",
+				discordUserId: "mock-user",
+			});
 
+			const mockBridge = createMockBridge();
 			const host = createFakeHostApi(agentDir);
-			lemmeaskchat(host.api);
+			lemmeaskchat(host.api, { bridgeFactory: () => mockBridge });
 
 			// 1. Subagent session start -> should ignore completely
 			const subCtx = createFakeCommandContext({
@@ -777,7 +951,7 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 			expect(noUiCtx.statuses.size).toBe(0);
 			expect(host.tools.length).toBe(0);
 
-			// 3. Main agent with UI and away: true -> sets status and registers ask tool
+			// 3. Main agent with UI and away: true and configured -> sets status and registers ask tool
 			const mainCtx = createFakeCommandContext({
 				agentKind: "main",
 				hasUI: true,
@@ -786,6 +960,24 @@ describe("/lemmeaskchat commands & lifecycle", () => {
 			expect(mainCtx.statuses.get("lemmeaskchat")).toBe("away → Discord");
 			expect(host.tools.length).toBe(1);
 			expect(defined(host.tools[0]).name).toBe("ask");
+			await host.emit("session_shutdown", mainCtx);
+		});
+
+		it("session_start clears status and warns when away mode is saved without credentials", async () => {
+			const agentDir = makeTempAgentDir();
+			saveConfig(agentDir, { away: true });
+
+			const host = createFakeHostApi(agentDir);
+			lemmeaskchat(host.api);
+
+			const mainCtx = createFakeCommandContext({
+				agentKind: "main",
+				hasUI: true,
+			});
+			await host.emit("session_start", mainCtx);
+			expect(mainCtx.statuses.get("lemmeaskchat")).toBeUndefined();
+			expect(loadConfig(agentDir).away).toBe(false);
+			expect(mainCtx.notifications.some((n) => n.message.includes("not configured"))).toBe(true);
 		});
 
 		it("session_start clears status when away mode is disabled", async () => {
