@@ -11,7 +11,7 @@ import {
 	saveConfig,
 } from "./config.ts";
 import { getBridge, type DiscordConversation } from "./discord/bridge.ts";
-import type { HostApi, HostContext, HostLogger } from "./host.ts";
+import type { HostApi, HostContext, HostEphemeralTurnResult, HostLogger } from "./host.ts";
 
 export interface BridgeLike {
 	openConversation(onPrompt: (text: string) => void): Promise<DiscordConversation>;
@@ -138,6 +138,7 @@ export class AwaySessionController {
 	private hasPendingContinuation = false;
 	private runEpoch = 0;
 	private activationGen = 0;
+	private readonly activeSideControllers = new Set<AbortController>();
 
 	private idleTimer: unknown = undefined;
 	private idleTimerEpoch: number | undefined = undefined;
@@ -164,6 +165,10 @@ export class AwaySessionController {
 
 	public get isAway(): boolean {
 		return this.isAwayActive;
+	}
+
+	private hasActiveSideWork(): boolean {
+		return this.activeSideControllers.size > 0;
 	}
 
 	public setContext(ctx: HostContext): void {
@@ -295,6 +300,10 @@ export class AwaySessionController {
 			return;
 		}
 
+		if (this.hasActiveSideWork()) {
+			return;
+		}
+
 		this.armIdleTimer(endEpoch);
 	}
 
@@ -320,6 +329,9 @@ export class AwaySessionController {
 				this.scheduleIdleCheck(epoch, attempt + 1);
 				return;
 			}
+			if (this.hasActiveSideWork()) {
+				return;
+			}
 			this.armIdleTimer(epoch);
 		}, delay);
 	}
@@ -330,7 +342,14 @@ export class AwaySessionController {
 			this.idleTimer = undefined;
 			this.idleTimerEpoch = undefined;
 		}
-		if (this.runEpoch !== epoch || this.isRunning || !this.isAwayActive || !this.conversation || this.isBusy()) {
+		if (
+			this.runEpoch !== epoch ||
+			this.isRunning ||
+			!this.isAwayActive ||
+			!this.conversation ||
+			this.isBusy() ||
+			this.hasActiveSideWork()
+		) {
 			return;
 		}
 
@@ -349,8 +368,8 @@ export class AwaySessionController {
 		if (this.idleTimerEpoch !== epoch || this.runEpoch !== epoch || !this.isAwayActive) {
 			return;
 		}
-		if (this.isBusy()) {
-			// Invariant: when idle timer fires while busy, schedule post-busy idle check and start full new idle window once truly idle.
+		if (this.isBusy() || this.hasActiveSideWork()) {
+			// Invariant: when idle timer fires while busy or side work active, schedule post-busy idle check and start full new idle window once truly idle.
 			this.scheduleIdleCheck(epoch, 0);
 			return;
 		}
@@ -359,6 +378,7 @@ export class AwaySessionController {
 		this.clearTimers();
 		this.runEpoch++;
 		this.activationGen++;
+		this.cancelSideWork();
 		this.errorCleanup?.();
 		this.errorCleanup = undefined;
 
@@ -380,6 +400,33 @@ export class AwaySessionController {
 			return;
 		}
 
+		const trimmed = text.trim();
+		if (!trimmed) {
+			return;
+		}
+
+		if (/^\/btw(?=$|[\s:])/.test(trimmed)) {
+			let remainder = trimmed.slice(4);
+			if (remainder.startsWith(":")) {
+				remainder = remainder.slice(1);
+			}
+			const question = remainder.trim();
+			if (!question) {
+				const conv = this.conversation;
+				const activation = this.activationGen;
+				void conv.send("Use /btw <question> to ask a side question.").catch((err) => {
+					if (this.activationGen !== activation || !this.isAwayActive || this.conversation !== conv) {
+						return;
+					}
+					const msg = err instanceof Error ? err.message : String(err);
+					this.logger?.warn?.("Failed to send /btw usage message", { error: msg });
+				});
+				return;
+			}
+			void this.handleSideQuestion(question, this.conversation, this.activationGen);
+			return;
+		}
+
 		if (typeof this.pi.sendUserMessage !== "function") {
 			const errMsg = "Host sendUserMessage runtime method is not available.";
 			this.logger?.error?.(errMsg);
@@ -392,11 +439,6 @@ export class AwaySessionController {
 		this.clearTimers();
 		this.runEpoch++;
 		const promptEpoch = this.runEpoch;
-
-		const trimmed = text.trim();
-		if (!trimmed) {
-			return;
-		}
 
 		const busy = this.isBusy();
 		try {
@@ -422,6 +464,130 @@ export class AwaySessionController {
 		}
 	}
 
+	private async handleSideQuestion(
+		question: string,
+		conv: DiscordConversation,
+		activation: number,
+	): Promise<void> {
+		this.clearTimers();
+		const abortController = new AbortController();
+		this.activeSideControllers.add(abortController);
+
+		try {
+			if (typeof this.currentContext?.runEphemeralTurn !== "function") {
+				const errMsg = "Host does not support ephemeral side questions (/btw).";
+				this.logger?.warn?.(errMsg);
+				this.currentContext?.ui?.notify?.(`lemmeaskchat: ${errMsg}`, "warning");
+				if (
+					this.activationGen === activation &&
+					this.isAwayActive &&
+					this.conversation === conv
+				) {
+					try {
+						const name = formatSessionName(this.pi, this.currentContext);
+						await conv.send(`Session “${name}” — /btw\n\nError: ${errMsg}`);
+					} catch (sendErr) {
+						const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+						this.logger?.warn?.("Failed to send /btw error message to Discord", { error: msg });
+					}
+				}
+				return;
+			}
+
+			const promptText = `<btw>\nEphemeral side question for current interactive session.\nAnswer briefly, directly; use conversation context already provided.\nNEVER use tools.\n\n${question}\n</btw>`;
+
+			let result: HostEphemeralTurnResult;
+			try {
+				result = await this.currentContext.runEphemeralTurn({
+					promptText,
+					replyMaxBytes: Number.POSITIVE_INFINITY,
+					signal: abortController.signal,
+				});
+			} catch (err) {
+				if (
+					abortController.signal.aborted ||
+					this.activationGen !== activation ||
+					!this.isAwayActive ||
+					this.conversation !== conv
+				) {
+					return;
+				}
+				const errMsg = err instanceof Error ? err.message : String(err);
+				this.logger?.warn?.("Ephemeral side question (/btw) failed", { error: errMsg });
+				this.currentContext?.ui?.notify?.(`lemmeaskchat: /btw failed: ${errMsg}`, "warning");
+				const name = formatSessionName(this.pi, this.currentContext);
+				try {
+					await conv.send(`Session “${name}” — /btw\n\nError: ${errMsg}`);
+				} catch (sendErr) {
+					const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+					this.logger?.warn?.("Failed to send /btw failure message to Discord", { error: msg });
+				}
+				return;
+			}
+
+			if (
+				abortController.signal.aborted ||
+				this.activationGen !== activation ||
+				!this.isAwayActive ||
+				this.conversation !== conv
+			) {
+				return;
+			}
+
+			const rawReply = result.replyText?.trim();
+			const name = formatSessionName(this.pi, this.currentContext);
+			const content = rawReply
+				? `Session “${name}” — /btw\n\n${rawReply}`
+				: `Session “${name}” — /btw\n\n(No response provided)`;
+
+			try {
+				await conv.send(content);
+			} catch (sendErr) {
+				if (
+					this.activationGen !== activation ||
+					!this.isAwayActive ||
+					this.conversation !== conv
+				) {
+					return;
+				}
+				const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+				this.logger?.warn?.("Failed to send /btw answer to Discord", { error: msg });
+				this.currentContext?.ui?.notify?.(`lemmeaskchat: Failed to send /btw answer: ${msg}`, "warning");
+			}
+		} finally {
+			this.activeSideControllers.delete(abortController);
+			this.onSideWorkSettled(activation);
+		}
+	}
+
+	private onSideWorkSettled(activation: number): void {
+		if (this.activationGen !== activation || !this.isAwayActive || !this.conversation) {
+			return;
+		}
+		if (this.hasActiveSideWork()) {
+			return;
+		}
+		if (this.isRunning) {
+			return;
+		}
+		if (this.isBusy()) {
+			this.scheduleIdleCheck(this.runEpoch, 0);
+			return;
+		}
+		this.armIdleTimer(this.runEpoch);
+	}
+
+	private cancelSideWork(): void {
+		for (const controller of this.activeSideControllers) {
+			try {
+				controller.abort();
+			} catch {
+				// ignore abort errors
+			}
+		}
+		this.activeSideControllers.clear();
+	}
+
 	private handleFatalError(err: Error): void {
 		if (!this.isAwayActive) {
 			return;
@@ -440,6 +606,7 @@ export class AwaySessionController {
 		this.clearTimers();
 		this.runEpoch++;
 		this.activationGen++;
+		this.cancelSideWork();
 		this.errorCleanup?.();
 		this.errorCleanup = undefined;
 
@@ -471,6 +638,7 @@ export class AwaySessionController {
 			this.activationGen++;
 			this.clearTimers();
 			this.runEpoch++;
+			this.cancelSideWork();
 			this.errorCleanup?.();
 			this.errorCleanup = undefined;
 
@@ -490,6 +658,7 @@ export class AwaySessionController {
 			this.isAwayActive = false;
 			this.hasPendingContinuation = false;
 			this.activationGen++;
+			this.cancelSideWork();
 			this.errorCleanup?.();
 			this.errorCleanup = undefined;
 			this.conversation?.close();
@@ -570,6 +739,7 @@ export class AwaySessionController {
 			this.hasPendingContinuation = false;
 			this.clearTimers();
 			this.activationGen++;
+			this.cancelSideWork();
 			this.errorCleanup?.();
 			this.errorCleanup = undefined;
 			this.conversation?.close();
@@ -668,6 +838,7 @@ export class AwaySessionController {
 		this.clearTimers();
 		this.runEpoch++;
 		this.activationGen++;
+		this.cancelSideWork();
 		this.errorCleanup?.();
 		this.errorCleanup = undefined;
 		const conv = this.conversation;
