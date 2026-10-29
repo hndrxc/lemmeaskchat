@@ -1,6 +1,6 @@
 # omp-lemmeaskchat
 
-Discord DM relay and away-mode conversation plugin for [oh-my-pi (`omp`)](https://github.com/oh-my-pi)'s built-in `ask` tool and interactive sessions. When an agent prompts for clarification or confirmation, questions are forwarded directly to your Discord DM so you can answer from your phone or desktop via buttons, menus, or typed replies—while the terminal prompt stays active in parallel. In away mode, completion announcements notify you when an agent run finishes and allow continuing the conversation by quote-replying directly from Discord.
+Discord DM relay and away-mode conversation plugin for [oh-my-pi (`omp`)](https://github.com/oh-my-pi)'s built-in `ask` tool and interactive sessions. When an agent prompts for clarification or confirmation, questions are forwarded directly to your Discord DM so you can answer from your phone or desktop via buttons, menus, or typed replies—while the terminal prompt stays active in parallel. In away mode, completion announcements notify you when an agent run finishes and allow continuing the conversation or asking isolated `/btw` side questions by quote-replying directly from Discord.
 
 ## Installation
 
@@ -60,6 +60,28 @@ Session names use the custom name or fall back to `<directory> (<session-id-firs
 - **Answering an Ask:** Quote-replying to an `ask` prompt (or sending text while an ask is open) answers that question. Unquoted messages **never** start new prompts.
 - **Message Splitting:** Responses exceeding Discord's 2,000-character limit are automatically split into chunks, each remaining a valid quote-reply target.
 
+### Ephemeral Side Questions (`/btw`)
+
+You can ask isolated side questions without interrupting running work or polluting the session transcript by prefixing your quote-reply with `/btw <question>`:
+
+```text
+/btw What was the name of the function we just modified?
+```
+
+The response is returned directly in Discord under a distinct side-question header:
+
+```text
+Session “lemmeaskchat (4a9f12bc)” — /btw
+
+We modified `handlePrompt` in `src/away-session.ts`.
+```
+
+- **Native Ephemeral Isolation:** Side questions execute via the host's native `ctx.runEphemeralTurn` API with isolated context. They run concurrently alongside active tool batches or streaming turns without interrupting, steering, or blocking them. Tools are disabled and never run, and side exchanges never enter the main conversation history or session `.jsonl` transcript.
+- **Bare `/btw` Usage:** Sending a bare `/btw` (or `/btw:`) without a question returns a concise usage reminder (`Use /btw <question> to ask a side question.`). Because the native interactive TUI history viewer cannot render in Discord, bare commands do not open an interactive viewer, trigger a model turn, or reset/postpone the idle timeout deadline.
+- **Ordinary Prompts & Asks Unchanged:** Quote-replies without `/btw` continue to route as regular prompts (queued behind active runs if busy). Answers to active `ask` dialogs are always passed literally without slash command parsing. Side questions are independent single turns; replying to a `/btw` answer without `/btw` is treated as a normal prompt to the main session.
+- **Idle Timeout & Cancellation:** In-flight side calls and Discord answer delivery hold the away idle timeout. Once all side queries and main operations finish, the full idle countdown resumes only if the session is truly idle. Turning away mode off (`/lemmeaskchat away off`), session switching, or idle expiration cancels active side calls via `AbortSignal`, but **never** aborts the main session turn.
+- **Scope & Persistence:** Discord relays each `/btw` query as an independent, single-turn question with current session context. Upstream TUI history viewing and session branching from side questions are not persisted or supported over Discord.
+
 ### Idle Timeout
 
 After an output is delivered and the session is truly idle, an idle timer starts:
@@ -103,8 +125,8 @@ bun test            # Run unit and integration tests
 bun run typecheck   # Typecheck TypeScript sources
 ```
 
-Tested against `@oh-my-pi/pi-coding-agent@18.12.4` and `omp 18.13.3` on Bun 1.4.2. The plugin wraps the host's native `ask` tool at session startup to preserve TUI formatting; changes to host internal tool schemas in future `omp` versions may require updates.
+Host interfaces are checked against `@oh-my-pi/pi-coding-agent@18.12.4`; the current interactive smoke runs use `omp 18.14.0` on Bun 1.4.2. The plugin wraps the host's native `ask` tool at session startup to preserve TUI formatting; changes to host internal tool schemas in future `omp` versions may require updates.
 
 ### Verification
 
-In-process interactive smoke verification against `omp 18.13.3` verified session naming, prompt follow-up, completion notifications, quote-reply routing, preserved multi-turn history, and idle timeout expiration. See [research/active-session-prompting.md](research/active-session-prompting.md) for execution details, smoke scope, and upstream API references.
+Interactive smoke runs verified the away conversation loop on `omp 18.13.3`. A separate `omp 18.14.0` smoke verified `/btw` running concurrently with the main turn, side-question isolation from main history, unchanged ordinary follow-ups, and idle expiry only after side delivery. These runs used local Discord and model substitutes, not live Discord or production providers. See [research/active-session-prompting.md](research/active-session-prompting.md) for execution details and upstream interface references.
