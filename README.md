@@ -1,10 +1,31 @@
 # omp-lemmeaskchat
 
-Discord DM relay and away-mode conversation plugin for [oh-my-pi (`omp`)](https://github.com/oh-my-pi)'s built-in `ask` tool and interactive sessions. When an agent prompts for clarification or confirmation, questions are forwarded directly to your Discord DM so you can answer from your phone or desktop via buttons, menus, or typed replies—while the terminal prompt stays active in parallel. In away mode, completion announcements notify you when an agent run finishes and allow continuing the conversation or asking isolated `/btw` side questions by quote-replying directly from Discord.
+Discord DM relay and away-mode conversation plugin for [oh-my-pi (`omp`)](https://omp.sh). Answer the built-in `ask` tool from Discord using buttons, menus, or typed replies while the terminal prompt stays active in parallel. Continue sessions remotely, receive completion notifications, and ask isolated `/btw` side questions.
+
+## Features
+
+- Ask relay with buttons, menus, typed replies, and multi-question support.
+- First-answer-wins between Discord and the terminal.
+- Delayed ask DMs, or immediate ask DMs in away mode.
+- Completion notifications and quote-reply prompts to continue a session.
+- Isolated `/btw` side questions alongside running work.
+- Configurable away idle timeout.
+
+All features above are available in [`omp-lemmeaskchat@0.2.0` on npm](https://www.npmjs.com/package/omp-lemmeaskchat).
 
 ## Installation
 
-Requires [Bun](https://bun.sh) `>= 1.3.0` and `omp` ([`@oh-my-pi/pi-coding-agent`](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent) `>= 18.12.4`).
+Requires [`omp`](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent) `>= 18.12.4`.
+
+### From npm
+
+```bash
+omp plugin install omp-lemmeaskchat
+```
+
+### From source (development)
+
+Use this path for local development or unreleased changes on `main`. Also requires [Bun](https://bun.sh) `>= 1.3.0`.
 
 ```bash
 git clone https://github.com/hndrxc/lemmeaskchat.git
@@ -12,6 +33,8 @@ cd lemmeaskchat
 bun install
 omp plugin link .
 ```
+
+Start a new `omp` session after installing, then complete the Discord bot setup below.
 
 ## Discord Bot Setup
 
@@ -79,7 +102,7 @@ We modified `handlePrompt` in `src/away-session.ts`.
 - **Native Ephemeral Isolation:** Side questions execute via the host's native `ctx.runEphemeralTurn` API with isolated context. They run concurrently alongside active tool batches or streaming turns without interrupting, steering, or blocking them. Tools are disabled and never run, and side exchanges never enter the main conversation history or session `.jsonl` transcript.
 - **Bare `/btw` Usage:** Sending a bare `/btw` (or `/btw:`) without a question returns a concise usage reminder (`Use /btw <question> to ask a side question.`). Because the native interactive TUI history viewer cannot render in Discord, bare commands do not open an interactive viewer, trigger a model turn, or reset/postpone the idle timeout deadline.
 - **Ordinary Prompts & Asks Unchanged:** Quote-replies without `/btw` continue to route as regular prompts (queued behind active runs if busy). Answers to active `ask` dialogs are always passed literally without slash command parsing. Side questions are independent single turns; replying to a `/btw` answer without `/btw` is treated as a normal prompt to the main session.
-- **Idle Timeout & Cancellation:** In-flight side calls and Discord answer delivery hold the away idle timeout. Once all side queries and main operations finish, the full idle countdown resumes only if the session is truly idle. Turning away mode off (`/lemmeaskchat away off`), session switching, or idle expiration cancels active side calls via `AbortSignal`, but **never** aborts the main session turn.
+- **Idle Timeout & Cancellation:** In-flight side calls and Discord answer delivery hold the away idle timeout. Once all side queries and main operations finish, the full idle countdown resumes only if the session is truly idle. Turning away mode off (`/lemmeaskchat away off`) or switching sessions cancels active side calls via `AbortSignal`, but **never** aborts the main session turn.
 - **Scope & Persistence:** Discord relays each `/btw` query as an independent, single-turn question with current session context. Upstream TUI history viewing and session branching from side questions are not persisted or supported over Discord.
 
 ### Idle Timeout

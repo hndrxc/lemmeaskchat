@@ -1,6 +1,6 @@
 {
   "name": "omp-lemmeaskchat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discord DM relay for oh-my-pi ask prompts with interactive buttons and typed replies",
   "type": "module",
   "license": "MIT",
